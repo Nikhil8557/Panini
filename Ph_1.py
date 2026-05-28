@@ -239,6 +239,7 @@ class GenomicHourglassPhase1(nn.Module):
         super().__init__()
         self.L_latent = L_latent
 
+        # Initial RC-Symmetric Downsampler used ONLY for the boundary router
         phi_in_ds = [3, 2, 1, 0]
         phi_out_ds = list(range(8, 16)) + list(range(0, 8))
         self.dna_downsampler = SymmetricConv1d(
@@ -248,10 +249,11 @@ class GenomicHourglassPhase1(nn.Module):
 
         self.router = HNetRARRouter(in_channels=16, L_latent=L_latent, sigma=sigma)
 
-        phi_in_scanner = phi_out_ds
-        phi_out_scanner = list(range(8, 16)) + list(range(0, 8))
+        # --- CRITICAL RESOLUTION FIX: Scanner now accepts raw 4-channel DNA ---
+        phi_in_scanner = [3, 2, 1, 0] # Watson-Crick bases swap
+        phi_out_scanner = list(range(8, 16)) + list(range(0, 8)) # 16 hidden channel pairs
         self.motif_scanner = SymmetricConv1d(
-            in_channels=16, out_channels=16, kernel_size=19, padding=9,
+            in_channels=4, out_channels=16, kernel_size=19, padding=9,
             symmetry_type="rc", phi_in=phi_in_scanner, phi_out=phi_out_scanner
         )
 
@@ -272,15 +274,20 @@ class GenomicHourglassPhase1(nn.Module):
     def forward(self, X_DNA: torch.Tensor, X_tss: torch.Tensor, X_wave: torch.Tensor) -> Tuple[
         torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
     ]:
-        X_DNA_ds = self.dna_downsampler(X_DNA)
-        X_tss_ds = F.max_pool1d(X_tss, kernel_size=100, stride=100)
-        X_wave_ds = F.avg_pool1d(X_wave, kernel_size=100, stride=100)
+        # 1. Coarse downsampling for the boundary router
+        X_DNA_ds = self.dna_downsampler(X_DNA) # (B, 16, 20000)
+        X_tss_ds = F.max_pool1d(X_tss, kernel_size=100, stride=100) # (B, 1, 20000)
+        X_wave_ds = F.avg_pool1d(X_wave, kernel_size=100, stride=100) # (B, 2, 20000)
 
-        A, p_t = self.router(X_DNA_ds)
+        A, p_t = self.router(X_DNA_ds) # A: (B, 2000, 20000)
 
-        S_motif_raw_ds = self.motif_scanner(X_DNA_ds)
-        H_DNA_high = F.gelu(self.conv_local(S_motif_raw_ds))
-        H_fwd = torch.bmm(H_DNA_high, A.transpose(1, 2))
+        # --- CRITICAL RESOLUTION FIX: Scan raw DNA first, then downsample activations ---
+        S_motif_raw = self.motif_scanner(X_DNA) # Scan at 1-bp resolution -> (B, 16, 2000000)
+        # Max-pool activations to keep peak motif boundaries intact at the 20k scale
+        S_motif_raw_ds = F.max_pool1d(S_motif_raw, kernel_size=100, stride=100) # (B, 16, 20000)
+        
+        H_DNA_high = F.gelu(self.conv_local(S_motif_raw_ds)) # (B, 128, 20000)
+        H_fwd = torch.bmm(H_DNA_high, A.transpose(1, 2)) # (B, 128, 2000)
 
         phi_swap_in = list(range(64, 128)) + list(range(0, 64))
         phi_swap_out = list(range(128, 256)) + list(range(0, 128))
