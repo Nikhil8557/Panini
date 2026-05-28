@@ -40,17 +40,29 @@ class SymmetricConv1d(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.symmetry_type == "spatial":
+            # Spatial reflection symmetry: W[c_out, c_in, k] = W[c_out, c_in, K-1-k]
             weight_spatial_reversed = torch.flip(self.weight, dims=[2])
             W_sym = (self.weight + weight_spatial_reversed) / 2.0
+            b_sym = self.bias  # Spatial reverse does not affect channel bias
+            
         elif self.symmetry_type == "rc":
+            # Reverse-complement weight symmetry
             W_rc = torch.flip(self.weight[self.phi_out][:, self.phi_in], dims=[2])
             W_sym = (self.weight + W_rc) / 2.0
+            # --- CORRECTION: Symmetrize channel bias to prevent asymmetry leaks ---
+            b_sym = (self.bias + self.bias[self.phi_out]) / 2.0 if self.phi_out is not None else self.bias
+            
         elif self.symmetry_type == "rc_out_only":
             W_rc = torch.flip(self.weight[self.phi_out], dims=[2])
             W_sym = (self.weight + W_rc) / 2.0
+            # --- CORRECTION: Symmetrize channel bias to prevent asymmetry leaks ---
+            b_sym = (self.bias + self.bias[self.phi_out]) / 2.0 if self.phi_out is not None else self.bias
+            
         else:
             W_sym = self.weight
-        return F.conv1d(x, W_sym, self.bias, self.stride, self.padding, self.dilation)
+            b_sym = self.bias
+
+        return F.conv1d(x, W_sym, b_sym, self.stride, self.padding, self.dilation)
 
 
 class HNetRARRouter(nn.Module):
@@ -134,7 +146,29 @@ class RealDiagonalSSM(nn.Module):
             out_t = torch.sum(self.C * state, dim=-1) + self.D * x[:, :, t]
             outputs.append(out_t)
         return torch.stack(outputs, dim=-1)
+        
+class RCInvariantAlignHead(nn.Module):
+    """
+    Projects RC-equivariant sequence latents to an RC-invariant representation,
+    matching the physical and mathematical symmetries of non-complementary tracks [1].
+    """
+    def __init__(self, channels: int = 256):
+        super().__init__()
+        self.proj = nn.Conv1d(channels, channels, kernel_size=1)
+        # Define Watson-Crick complement channel swaps for the 256 output channels
+        self.register_buffer("phi_swap_out", torch.tensor(list(range(128, 256)) + list(range(0, 128))))
 
+    def forward(self, h_dna: torch.Tensor) -> torch.Tensor:
+        # Forward DNA latent projection
+        y_fwd = self.proj(h_dna)
+        
+        # Reverse-complemented DNA latent projection
+        x_rev = torch.flip(h_dna[:, self.phi_swap_out, :], dims=[2])
+        y_rev = self.proj(x_rev)
+        
+        # Align spatially and average to ensure strict RC-invariance
+        y_rev_aligned = torch.flip(y_rev, dims=[2])
+        return (y_fwd + y_rev_aligned) / 2.0
 
 class SymmetricMambaModule(nn.Module):
     def __init__(self, channels: int = 128, out_channels: int = 256):
@@ -269,7 +303,7 @@ class GenomicHourglassPhase1(nn.Module):
         self.wave_wno = RealWNO1DBlock(in_channels=2, out_channels=128, n_scales=n_scales, n_modes=n_modes, omega0=omega0)
 
         # Continuous Multi-Modal Alignment (CMMA) Projection Head
-        self.align_head = nn.Conv1d(256, 256, kernel_size=1)
+        self.align_head = RCInvariantAlignHead(channels=256)
 
     def forward(self, X_DNA: torch.Tensor, X_tss: torch.Tensor, X_wave: torch.Tensor) -> Tuple[
         torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
@@ -393,9 +427,15 @@ class RealDatasetLoader:
 # 3. STANDALONE PHASE 1 TRAINING LOOP
 # =====================================================================
 
-def calculate_cross_modal_coherence(h_dna, h_sig):
-    h_dna_n = F.normalize(h_dna[:, :128, :], p=2, dim=1)
-    h_sig_norm = F.normalize(h_sig[:, 128:, :], p=2, dim=1)
+def calculate_cross_modal_coherence(h_dna: torch.Tensor, h_sig: torch.Tensor) -> np.ndarray:
+    """
+    Measures exact channel-alignment scaling across sequence and signals [3].
+    Slices are removed to compute coherence over the full 256-channel space.
+    """
+    h_dna_n = F.normalize(h_dna, p=2, dim=1)
+    h_sig_norm = F.normalize(h_sig, p=2, dim=1)
+    
+    # Pointwise cosine similarity across all 256 aligned features
     coherence = (h_dna_n * h_sig_norm).sum(dim=1).squeeze(0)
     return coherence.cpu().numpy()
 
