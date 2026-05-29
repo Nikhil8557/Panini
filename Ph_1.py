@@ -198,6 +198,53 @@ class SymmetricDilatedTSSStack(nn.Module):
         h3 = F.gelu(self.conv3(h2))
         return self.conv4(h3)
 
+class PyramidalSymmetricCompressor(nn.Module):
+    """
+    Mitigates aggressive downsampling by compressing spatial sequences gradually
+    over three 10x stages, interleaving symmetric convolutions to learn 
+    hierarchical sequence representations [1, 2].
+    """
+    def __init__(self, in_channels: int = 16, out_channels: int = 128):
+        super().__init__()
+        
+        # Complement index mappings for each hierarchical channel stage
+        phi_16 = list(range(8, 16)) + list(range(0, 8))
+        phi_32 = list(range(16, 32)) + list(range(0, 16))
+        phi_64 = list(range(32, 64)) + list(range(0, 32))
+        phi_128 = list(range(64, 128)) + list(range(0, 64))
+        
+        # Stage 1: 2,000,000 -> 200,000 (10x)
+        self.conv1 = SymmetricConv1d(
+            in_channels=in_channels, out_channels=32, kernel_size=5, padding=2,
+            symmetry_type="rc", phi_in=phi_16, phi_out=phi_32
+        )
+        # Stage 2: 200,000 -> 20,000 (10x)
+        self.conv2 = SymmetricConv1d(
+            in_channels=32, out_channels=64, kernel_size=5, padding=2,
+            symmetry_type="rc", phi_in=phi_32, phi_out=phi_64
+        )
+        # Stage 3: 20,000 -> 2,000 (10x)
+        self.conv3 = SymmetricConv1d(
+            in_channels=64, out_channels=out_channels, kernel_size=5, padding=2,
+            symmetry_type="rc", phi_in=phi_64, phi_out=phi_128
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x shape: (B, 16, 2,000,000)
+        
+        # Stage 1
+        h1_pool = F.max_pool1d(x, kernel_size=10, stride=10)       # (B, 16, 200000)
+        h1 = F.gelu(self.conv1(h1_pool))                            # (B, 32, 200000)
+        
+        # Stage 2
+        h2_pool = F.max_pool1d(h1, kernel_size=10, stride=10)      # (B, 32, 20000)
+        h2 = F.gelu(self.conv2(h2_pool))                            # (B, 64, 20000)
+        
+        # Stage 3
+        h3_pool = F.max_pool1d(h2, kernel_size=10, stride=10)      # (B, 64, 2000)
+        h3 = F.gelu(self.conv3(h3_pool))                            # (B, 128, 2000)
+        
+        return h3
 
 class RealWaveletSpectralConv1D(nn.Module):
     def __init__(self, in_channels: int, out_channels: int, n_scales: int = 16, n_modes: int = 16, omega0: float = 5.0):
@@ -261,82 +308,64 @@ class RealWNO1DBlock(nn.Module):
         return self.act(self.wavelet_conv(x) + self.residual(x))
 
 
-class GenomicHourglassPhase1(nn.Module):
+class GenomicHourglassPhase1MultiScale(nn.Module):
+    """
+    Symmetric Pyramidal Phase 1 Pipeline.
+    DNA sequence is processed first at 1-bp, then compressed gradually (10x -> 10x -> 10x)
+    to match the 1-kb pre-binned track coordinates, preserving sequence detail [1].
+    """
     def __init__(
         self,
-        L_latent: int = 2000, # Defines the length of the latent space representation for soft-routing.
-        sigma: float = 0.005, # Controls the coordinate bandwidth for the soft-routing matrix.
-        n_scales: int = 16,  # Number of wavelet scales used in the wavelet spectral convolution.
-        n_modes: int = 16,   # Number of Fourier modes considered in the wavelet spectral convolution.
-        omega0: float = 5.0  # Central frequency for the wavelet filter.
+        L_latent: int = 2000,
+        n_scales: int = 16,
+        n_modes: int = 16,
+        omega0: float = 5.0
     ):
         super().__init__()
         self.L_latent = L_latent
 
-        # Initial RC-Symmetric Downsampler used ONLY for the boundary router
-        phi_in_ds = [3, 2, 1, 0]
-        phi_out_ds = list(range(8, 16)) + list(range(0, 8))
-        self.dna_downsampler = SymmetricConv1d(
-            in_channels=4, out_channels=16, kernel_size=100, stride=100,
-            symmetry_type="rc", phi_in=phi_in_ds, phi_out=phi_out_ds
-        )
-
-        self.router = HNetRARRouter(in_channels=16, L_latent=L_latent, sigma=sigma)
-
-        # --- CRITICAL RESOLUTION FIX: Scanner now accepts raw 4-channel DNA ---
-        phi_in_scanner = [3, 2, 1, 0] # Watson-Crick bases swap
-        phi_out_scanner = list(range(8, 16)) + list(range(0, 8)) # 16 hidden channel pairs
+        # DNA Motif Scanner at 1-bp
+        phi_in_scanner = [3, 2, 1, 0]
+        phi_out_scanner = list(range(8, 16)) + list(range(0, 8))
         self.motif_scanner = SymmetricConv1d(
             in_channels=4, out_channels=16, kernel_size=19, padding=9,
             symmetry_type="rc", phi_in=phi_in_scanner, phi_out=phi_out_scanner
         )
 
-        phi_in_local = phi_out_scanner
-        phi_out_local = list(range(64, 128)) + list(range(0, 64))
-        self.conv_local = SymmetricConv1d(
-            in_channels=16, out_channels=128, kernel_size=5, padding=2,
-            symmetry_type="rc", phi_in=phi_in_local, phi_out=phi_out_local
-        )
-
+        # Pyramidal Symmetric Compressor replacing the single-stage MaxPool1D
+        self.pyramidal_compressor = PyramidalSymmetricCompressor(in_channels=16, out_channels=128)
+        
+        # 1D Latent Sequence Modeling
         self.mamba_wrapper = SymmetricMambaModule(channels=128, out_channels=256)
+        
+        # Signal Track Extractors
         self.tss_stack = SymmetricDilatedTSSStack()
         self.wave_wno = RealWNO1DBlock(in_channels=2, out_channels=128, n_scales=n_scales, n_modes=n_modes, omega0=omega0)
 
-        # Continuous Multi-Modal Alignment (CMMA) Projection Head
-        self.align_head = RCInvariantAlignHead(channels=256)
-
     def forward(self, X_DNA: torch.Tensor, X_tss: torch.Tensor, X_wave: torch.Tensor) -> Tuple[
-        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+        torch.Tensor, torch.Tensor
     ]:
-        # 1. Coarse downsampling for the boundary router
-        X_DNA_ds = self.dna_downsampler(X_DNA) # (B, 16, 20000)
-        X_tss_ds = F.max_pool1d(X_tss, kernel_size=100, stride=100) # (B, 1, 20000)
-        X_wave_ds = F.avg_pool1d(X_wave, kernel_size=100, stride=100) # (B, 2, 20000)
+        # X_DNA  : (B, 4, 2000000) (raw 1-bp sequence)
+        # X_tss  : (B, 1, 2000)    (pre-binned promoter peaks)
+        # X_wave : (B, 2, 2000)    (pre-binned continuous signals)
 
-        A, p_t = self.router(X_DNA_ds) # A: (B, 2000, 20000)
-
-        # --- CRITICAL RESOLUTION FIX: Scan raw DNA first, then downsample activations ---
-        S_motif_raw = self.motif_scanner(X_DNA) # Scan at 1-bp resolution -> (B, 16, 2000000)
-        # Max-pool activations to keep peak motif boundaries intact at the 20k scale
-        S_motif_raw_ds = F.max_pool1d(S_motif_raw, kernel_size=100, stride=100) # (B, 16, 20000)
+        # 1. DNA Branch: Scan at 1-bp, then compress gradually
+        S_motif_raw = self.motif_scanner(X_DNA)                    # (B, 16, 2000000)
+        S_motif_raw_ds = self.pyramidal_compressor(S_motif_raw)    # (B, 128, 2000)
         
-        H_DNA_high = F.gelu(self.conv_local(S_motif_raw_ds)) # (B, 128, 20000)
-        H_fwd = torch.bmm(H_DNA_high, A.transpose(1, 2)) # (B, 128, 2000)
-
+        # Bidirectional Sequence SSM
         phi_swap_in = list(range(64, 128)) + list(range(0, 64))
         phi_swap_out = list(range(128, 256)) + list(range(0, 128))
-        H_DNA = self.mamba_wrapper(H_fwd, phi_swap_in, phi_swap_out)
+        H_DNA = self.mamba_wrapper(S_motif_raw_ds, phi_swap_in, phi_swap_out) # (B, 256, 2000)
+        
+        # 2. Functional Signal Branches processed directly (No downsampling)
+        H_tss_pooled = self.tss_stack(X_tss)                       # (B, 128, 2000)
+        H_wave_spatial = self.wave_wno(X_wave)                     # (B, 128, 2000)
+        
+        # Consolidated functional track features
+        H_sig = torch.cat([H_tss_pooled, H_wave_spatial], dim=1)    # (B, 256, 2000)
 
-        H_tss_dilated = self.tss_stack(X_tss_ds)
-        H_tss_pooled = torch.bmm(H_tss_dilated, A.transpose(1, 2))
-
-        H_wno_high = self.wave_wno(X_wave_ds)
-        H_wave_spatial = torch.bmm(H_wno_high, A.transpose(1, 2))
-
-        # Consolidated functional track features via channel concatenation
-        H_sig = torch.cat([H_tss_pooled, H_wave_spatial], dim=1) # (B, 256, L_latent)
-
-        return H_DNA, H_sig, A, p_t
+        return H_DNA, H_sig
 
 # =====================================================================
 # 2. COORDINATED DATA LOADERS (FASTA + SIGNAL NPY)
